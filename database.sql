@@ -1,9 +1,11 @@
+-- ============================================================
+-- CREATE DATABASE
+-- ============================================================
 CREATE DATABASE IF NOT EXISTS parkease_db;
 USE parkease_db;
 
 -- ============================================================
 -- 1. USERS TABLE
--- Stores all user account information
 -- ============================================================
 DROP TABLE IF EXISTS users;
 CREATE TABLE users (
@@ -22,7 +24,6 @@ CREATE TABLE users (
 
 -- ============================================================
 -- 2. VEHICLES TABLE
--- Stores multiple vehicles per user
 -- ============================================================
 DROP TABLE IF EXISTS vehicles;
 CREATE TABLE vehicles (
@@ -42,7 +43,6 @@ CREATE TABLE vehicles (
 
 -- ============================================================
 -- 3. PARKING LOCATIONS TABLE
--- Stores parking lots/garages
 -- ============================================================
 DROP TABLE IF EXISTS parking_locations;
 CREATE TABLE parking_locations (
@@ -69,7 +69,6 @@ CREATE TABLE parking_locations (
 
 -- ============================================================
 -- 4. INDIVIDUAL PARKING SPOTS TABLE
--- Stores specific spot numbers within parking locations
 -- ============================================================
 DROP TABLE IF EXISTS parking_spots;
 CREATE TABLE parking_spots (
@@ -92,7 +91,6 @@ CREATE TABLE parking_spots (
 
 -- ============================================================
 -- 5. SPOT LOCKS TABLE
--- Temporary locks for spots when users are booking
 -- ============================================================
 DROP TABLE IF EXISTS spot_locks;
 CREATE TABLE spot_locks (
@@ -116,8 +114,7 @@ CREATE TABLE spot_locks (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================
--- 6. BOOKINGS TABLE
--- Stores all parking bookings
+-- 6. BOOKINGS TABLE (COMPLETE WITH ALL COLUMNS)
 -- ============================================================
 DROP TABLE IF EXISTS bookings;
 CREATE TABLE bookings (
@@ -160,7 +157,6 @@ CREATE TABLE bookings (
 
 -- ============================================================
 -- 7. PAYMENTS TABLE
--- Stores transaction details
 -- ============================================================
 DROP TABLE IF EXISTS payments;
 CREATE TABLE payments (
@@ -183,7 +179,6 @@ CREATE TABLE payments (
 
 -- ============================================================
 -- 8. REVIEWS TABLE
--- Stores user reviews for parking locations
 -- ============================================================
 DROP TABLE IF EXISTS reviews;
 CREATE TABLE reviews (
@@ -208,7 +203,6 @@ CREATE TABLE reviews (
 
 -- ============================================================
 -- 9. NOTIFICATIONS TABLE
--- Stores user notifications
 -- ============================================================
 DROP TABLE IF EXISTS notifications;
 CREATE TABLE notifications (
@@ -228,7 +222,6 @@ CREATE TABLE notifications (
 
 -- ============================================================
 -- 10. COUPONS TABLE
--- Stores discount coupons and promotions
 -- ============================================================
 DROP TABLE IF EXISTS coupons;
 CREATE TABLE coupons (
@@ -252,7 +245,6 @@ CREATE TABLE coupons (
 
 -- ============================================================
 -- 11. USER_COUPONS TABLE
--- Tracks which users used which coupons
 -- ============================================================
 DROP TABLE IF EXISTS user_coupons;
 CREATE TABLE user_coupons (
@@ -271,7 +263,6 @@ CREATE TABLE user_coupons (
 
 -- ============================================================
 -- 12. PARKING_HISTORY TABLE
--- Logs all parking events (entry/exit)
 -- ============================================================
 DROP TABLE IF EXISTS parking_history;
 CREATE TABLE parking_history (
@@ -292,68 +283,29 @@ CREATE TABLE parking_history (
     INDEX idx_exit_time (exit_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-DELIMITER //
-DROP PROCEDURE IF EXISTS CheckSpotAvailability//
-CREATE PROCEDURE CheckSpotAvailability(
-    IN p_location_id INT,
-    IN p_spot_number VARCHAR(20),
-    IN p_booking_date DATE,
-    IN p_start_time TIME,
-    IN p_end_time TIME,
-    IN p_user_id INT
-)
-BEGIN
-    DECLARE is_available BOOLEAN DEFAULT TRUE;
-    
-    -- Check confirmed bookings
-    IF EXISTS (
-        SELECT 1 FROM bookings 
-        WHERE parking_location_id = p_location_id 
-        AND spot_number = p_spot_number
-        AND booking_date = p_booking_date
-        AND status = 'confirmed'
-        AND (
-            (start_time < p_end_time AND end_time > p_start_time)
-        )
-    ) THEN
-        SET is_available = FALSE;
-    END IF;
-    
-    -- Check active locks by other users
-    IF is_available = TRUE AND EXISTS (
-        SELECT 1 FROM spot_locks 
-        WHERE parking_location_id = p_location_id 
-        AND spot_number = p_spot_number
-        AND booking_date = p_booking_date
-        AND is_active = TRUE 
-        AND expires_at > NOW()
-        AND locked_by != p_user_id
-        AND (
-            (start_time < p_end_time AND end_time > p_start_time)
-        )
-    ) THEN
-        SET is_available = FALSE;
-    END IF;
-    
-    SELECT is_available as is_available;
-END//
-DELIMITER ;
-
 -- ============================================================
--- TRIGGERS
+-- EVENTS
 -- ============================================================
 
--- Trigger to clean up expired locks automatically
-DELIMITER //
-DROP EVENT IF EXISTS clean_expired_locks//
+SET GLOBAL event_scheduler = ON;
+
+-- Event to clean expired locks every minute
+DROP EVENT IF EXISTS clean_expired_locks;
 CREATE EVENT IF NOT EXISTS clean_expired_locks
 ON SCHEDULE EVERY 1 MINUTE
 DO
-BEGIN
-    UPDATE spot_locks SET is_active = FALSE WHERE expires_at < NOW();
-END//
-DELIMITER ;
+UPDATE spot_locks SET is_active = FALSE WHERE expires_at < NOW();
+
+-- Event to auto-cancel pending bookings after 30 minutes
+DROP EVENT IF EXISTS auto_cancel_pending_bookings;
+CREATE EVENT IF NOT EXISTS auto_cancel_pending_bookings
+ON SCHEDULE EVERY 5 MINUTE
+DO
+UPDATE bookings 
+SET status = 'cancelled' 
+WHERE status = 'pending' 
+AND payment_status = 'pending'
+AND created_at < DATE_SUB(NOW(), INTERVAL 30 MINUTE);
 
 -- ============================================================
 -- VIEWS
@@ -367,10 +319,11 @@ SELECT
     pl.name as location_name,
     pl.address,
     pl.total_spots,
+    pl.available_spots,
     pl.price_per_hour,
     pl.features,
     COUNT(DISTINCT b.id) as booked_count,
-    pl.total_spots - COUNT(DISTINCT b.id) as available_spots
+    pl.total_spots - COUNT(DISTINCT b.id) as calculated_available
 FROM parking_locations pl
 LEFT JOIN bookings b ON pl.id = b.parking_location_id 
     AND b.status = 'confirmed' 
@@ -401,8 +354,22 @@ LEFT JOIN vehicles v ON b.vehicle_id = v.id
 WHERE b.status IN ('confirmed', 'pending')
 ORDER BY b.booking_date ASC, b.start_time ASC;
 
+-- View for user booking summary
+DROP VIEW IF EXISTS v_user_booking_summary;
+CREATE VIEW v_user_booking_summary AS
+SELECT 
+    u.id as user_id,
+    u.fullname,
+    u.email,
+    COUNT(b.id) as total_bookings,
+    SUM(CASE WHEN b.status = 'confirmed' THEN 1 ELSE 0 END) as active_bookings,
+    SUM(CASE WHEN b.payment_status = 'paid' THEN b.amount ELSE 0 END) as total_spent
+FROM users u
+LEFT JOIN bookings b ON u.id = b.user_id
+GROUP BY u.id;
+
 -- ============================================================
--- INDEXES FOR PERFORMANCE
+-- ADDITIONAL INDEXES FOR PERFORMANCE
 -- ============================================================
 
 CREATE INDEX idx_bookings_user_status ON bookings(user_id, status);
@@ -411,6 +378,8 @@ CREATE INDEX idx_bookings_payment ON bookings(payment_status, status);
 CREATE INDEX idx_vehicles_user_default ON vehicles(user_id, is_default);
 CREATE INDEX idx_notifications_user_read ON notifications(user_id, is_read);
 CREATE INDEX idx_spot_locks_cleanup ON spot_locks(expires_at, is_active);
+CREATE INDEX idx_bookings_location_date ON bookings(parking_location_id, booking_date);
+CREATE INDEX idx_payments_booking ON payments(booking_id);
 
 -- ============================================================
 -- VERIFICATION QUERIES
@@ -426,4 +395,5 @@ SELECT 'Parking Spots:' as '', COUNT(*) as count FROM parking_spots;
 SELECT 'Bookings:' as '', COUNT(*) as count FROM bookings;
 SELECT 'Payments:' as '', COUNT(*) as count FROM payments;
 SELECT 'Spot Locks:' as '', COUNT(*) as count FROM spot_locks;
+SELECT 'Coupons:' as '', COUNT(*) as count FROM coupons;
 SELECT '=========================================' as '';
